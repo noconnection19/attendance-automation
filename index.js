@@ -163,6 +163,22 @@ let bot = null;
 if (CONFIG.telegramToken && CONFIG.telegramChatId) {
   bot = new TelegramBot(CONFIG.telegramToken, { polling: true });
   log("Telegram Bot initialized with long polling.");
+
+  // Register commands for the Telegram Menu button
+  bot.setMyCommands([
+    { command: "status", description: "Cek status absensi & jadwal" },
+    { command: "note", description: "Atur catatan custom checkout" },
+    { command: "cuti", description: "Cuti / skip absen untuk hari ini" },
+    { command: "cuti_sampai", description: "Atur rentang cuti (YYYY-MM-DD)" },
+    { command: "aktifkan", description: "Aktifkan kembali absensi otomatis" },
+    { command: "checkin_now", description: "Jalankan check-in manual instan" },
+    { command: "checkout_now", description: "Jalankan check-out manual instan" },
+    { command: "help", description: "Tampilkan panduan perintah" }
+  ]).then(() => {
+    log("Telegram menu commands registered successfully.");
+  }).catch((err) => {
+    log(`Failed to register Telegram menu commands: ${err.message}`);
+  });
 } else {
   log("Telegram Bot NOT initialized (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing).");
 }
