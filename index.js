@@ -1,7 +1,10 @@
+const fs = require("fs");
+const path = require("path");
 const cron = require("node-cron");
+const { TelegramBot } = require("node-telegram-bot-api");
 
 // ============================================================
-// Configuration
+// Configuration & Settings
 // ============================================================
 const CONFIG = {
   apiBase: "https://prms-api.fid-app.my.id/api",
@@ -10,7 +13,37 @@ const CONFIG = {
   baseLatitude: parseFloat(process.env.BASE_LATITUDE || "-6.159868350846804"),
   baseLongitude: parseFloat(process.env.BASE_LONGITUDE || "106.87936991839877"),
   defaultNote: process.env.NOTE || "Standby POC AURORA",
+  telegramToken: process.env.TELEGRAM_BOT_TOKEN,
+  telegramChatId: process.env.TELEGRAM_CHAT_ID,
 };
+
+const SETTINGS_FILE = path.join(__dirname, "settings.json");
+
+/**
+ * Load settings from file or return default
+ */
+function loadSettings() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const data = fs.readFileSync(SETTINGS_FILE, "utf8");
+      return JSON.parse(data);
+    }
+  } catch (err) {
+    console.error(`[Settings] Gagal memuat file pengaturan: ${err.message}`);
+  }
+  return { customNote: null, skipUntil: null };
+}
+
+/**
+ * Save settings to file
+ */
+function saveSettings(settings) {
+  try {
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf8");
+  } catch (err) {
+    console.error(`[Settings] Gagal menyimpan file pengaturan: ${err.message}`);
+  }
+}
 
 // ============================================================
 // Utility Functions
@@ -90,6 +123,206 @@ function getDayName() {
     "Sabtu",
   ];
   return days[new Date().getDay()];
+}
+
+// ============================================================
+// Holiday & Telegram Integration Functions
+// ============================================================
+
+/**
+ * Check if today is a public holiday in Indonesia
+ */
+async function checkIndonesianHoliday() {
+  try {
+    const todayStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" }); // "YYYY-MM-DD"
+    const year = todayStr.split("-")[0];
+    const url = `https://api-hari-libur.vercel.app/api?year=${year}`;
+    
+    log(`Checking holiday status from API for today (${todayStr})...`);
+    const response = await fetch(url);
+    if (!response.ok) {
+      log(`Holiday API returned status: ${response.status}. Skipping holiday check.`);
+      return null;
+    }
+    const res = await response.json();
+    if (res && res.status && Array.isArray(res.data)) {
+      const holiday = res.data.find(h => h.date === todayStr);
+      if (holiday) {
+        log(`Today is a national holiday: ${holiday.description}`);
+        return holiday.description;
+      }
+    }
+  } catch (err) {
+    log(`Error checking holiday API: ${err.message}`);
+  }
+  return null;
+}
+
+let bot = null;
+
+if (CONFIG.telegramToken && CONFIG.telegramChatId) {
+  bot = new TelegramBot(CONFIG.telegramToken, { polling: true });
+  log("Telegram Bot initialized with long polling.");
+} else {
+  log("Telegram Bot NOT initialized (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing).");
+}
+
+async function sendTelegramNotification(message) {
+  if (!bot) return;
+  try {
+    await bot.sendMessage(CONFIG.telegramChatId, message, { parse_mode: "HTML" });
+    log("Telegram notification sent successfully.");
+  } catch (err) {
+    log(`Failed to send Telegram notification: ${err.message}`);
+  }
+}
+
+if (bot) {
+  bot.on("message", async (msg) => {
+    const chatId = msg.chat.id.toString();
+    const authorizedChatId = CONFIG.telegramChatId.toString();
+    
+    if (chatId !== authorizedChatId) {
+      log(`Unauthorized message received from chat ID: ${chatId}`);
+      return;
+    }
+    
+    const text = msg.text ? msg.text.trim() : "";
+    if (!text.startsWith("/")) return;
+    
+    const args = text.split(" ");
+    const command = args[0].toLowerCase();
+    
+    try {
+      if (command === "/start" || command === "/help") {
+        const helpMessage = `<b>🤖 PRMS Auto Attendance Bot</b>\n\n` +
+          `Daftar perintah yang tersedia:\n` +
+          `• <code>/status</code> - Cek status bot, koordinat, catatan, & jadwal hari ini\n` +
+          `• <code>/note [teks]</code> - Atur catatan custom untuk checkout\n` +
+          `• <code>/note reset</code> - Hapus catatan custom dan gunakan default\n` +
+          `• <code>/cuti</code> - Lewatkan absen untuk hari ini saja\n` +
+          `• <code>/cuti_sampai YYYY-MM-DD</code> - Atur cuti sampai tanggal tertentu\n` +
+          `• <code>/aktifkan</code> - Aktifkan kembali absen (hapus status cuti)\n` +
+          `• <code>/checkin_now</code> - Jalankan check-in manual instan sekarang\n` +
+          `• <code>/checkout_now</code> - Jalankan check-out manual instan sekarang`;
+        await bot.sendMessage(chatId, helpMessage, { parse_mode: "HTML" });
+      }
+      else if (command === "/status") {
+        const settings = loadSettings();
+        const todayStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" });
+        const holidayDesc = await checkIndonesianHoliday();
+        
+        let statusCuti = "Aktif (Mengecek Jadwal)";
+        if (settings.skipUntil) {
+          const skipUntilDate = new Date(settings.skipUntil);
+          const todayDate = new Date(todayStr);
+          if (todayDate <= skipUntilDate) {
+            statusCuti = `Cuti (Skip Absen hingga ${settings.skipUntil})`;
+          }
+        }
+        
+        const noteUsed = settings.customNote || CONFIG.defaultNote;
+        
+        const statusMessage = `<b>📊 Status PRMS Auto Attendance</b>\n\n` +
+          `• <b>User:</b> <code>${CONFIG.email}</code>\n` +
+          `• <b>Lokasi:</b> <code>${CONFIG.baseLatitude}, ${CONFIG.baseLongitude}</code>\n` +
+          `• <b>Note Checkout:</b> "${noteUsed}" ${settings.customNote ? "(Custom)" : "(Default)"}\n` +
+          `• <b>Status Jadwal:</b> ${statusCuti}\n` +
+          `• <b>Hari Ini (${getDayName()}, ${todayStr}):</b>\n` +
+          `  - Weekend: ${isWeekend() ? "Ya 🛑" : "Tidak ✅"}\n` +
+          `  - Hari Libur: ${holidayDesc ? `Ya (${holidayDesc}) 🛑` : "Tidak ✅"}`;
+        
+        await bot.sendMessage(chatId, statusMessage, { parse_mode: "HTML" });
+      }
+      else if (command === "/note") {
+        if (args.length < 2) {
+          const settings = loadSettings();
+          const currentNote = settings.customNote || CONFIG.defaultNote;
+          await bot.sendMessage(chatId, `Catatan checkout saat ini:\n"${currentNote}" ${settings.customNote ? "(Custom)" : "(Default)"}`, { parse_mode: "HTML" });
+          return;
+        }
+        
+        const action = args.slice(1).join(" ");
+        const settings = loadSettings();
+        
+        if (action.toLowerCase() === "reset") {
+          settings.customNote = null;
+          saveSettings(settings);
+          await bot.sendMessage(chatId, `Catatan checkout telah di-reset ke default:\n"${CONFIG.defaultNote}"`, { parse_mode: "HTML" });
+        } else {
+          settings.customNote = action;
+          saveSettings(settings);
+          await bot.sendMessage(chatId, `Catatan checkout berhasil diubah ke:\n"${action}"`, { parse_mode: "HTML" });
+        }
+      }
+      else if (command === "/cuti") {
+        const todayStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" });
+        const settings = loadSettings();
+        settings.skipUntil = todayStr;
+        saveSettings(settings);
+        await bot.sendMessage(chatId, `Mode cuti diaktifkan. Absensi akan dilewati untuk hari ini (${todayStr}).`, { parse_mode: "HTML" });
+      }
+      else if (command === "/cuti_sampai") {
+        if (args.length < 2) {
+          await bot.sendMessage(chatId, "Format salah. Gunakan: <code>/cuti_sampai YYYY-MM-DD</code>", { parse_mode: "HTML" });
+          return;
+        }
+        const targetDate = args[1].trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+          await bot.sendMessage(chatId, "Format tanggal salah. Gunakan format YYYY-MM-DD (contoh: 2026-07-15)", { parse_mode: "HTML" });
+          return;
+        }
+        
+        const settings = loadSettings();
+        settings.skipUntil = targetDate;
+        saveSettings(settings);
+        await bot.sendMessage(chatId, `Mode cuti diaktifkan. Absensi akan dilewati hingga tanggal <b>${targetDate}</b>.`, { parse_mode: "HTML" });
+      }
+      else if (command === "/aktifkan") {
+        const settings = loadSettings();
+        settings.skipUntil = null;
+        saveSettings(settings);
+        await bot.sendMessage(chatId, "Mode cuti dinonaktifkan. Jadwal absensi otomatis kembali aktif.", { parse_mode: "HTML" });
+      }
+      else if (command === "/checkin_now") {
+        await bot.sendMessage(chatId, "Menginisiasi check-in manual instan sekarang...", { parse_mode: "HTML" });
+        try {
+          const token = await login();
+          const status = await getAttendanceStatus(token);
+          if (status.checkedIn) {
+            await bot.sendMessage(chatId, "Sudah check-in hari ini, aksi dibatalkan.", { parse_mode: "HTML" });
+            await logout(token);
+            return;
+          }
+          const result = await checkIn(token);
+          await logout(token);
+          await bot.sendMessage(chatId, `✅ <b>Check-in manual berhasil!</b>\nResponse: <code>${JSON.stringify(result)}</code>`, { parse_mode: "HTML" });
+        } catch (err) {
+          await bot.sendMessage(chatId, `❌ <b>Check-in manual gagal:</b> ${err.message}`, { parse_mode: "HTML" });
+        }
+      }
+      else if (command === "/checkout_now") {
+        await bot.sendMessage(chatId, "Menginisiasi check-out manual instan sekarang...", { parse_mode: "HTML" });
+        try {
+          const token = await login();
+          const status = await getAttendanceStatus(token);
+          if (status.checkedOut) {
+            await bot.sendMessage(chatId, "Sudah check-out hari ini, aksi dibatalkan.", { parse_mode: "HTML" });
+            await logout(token);
+            return;
+          }
+          const result = await checkOut(token);
+          await logout(token);
+          await bot.sendMessage(chatId, `✅ <b>Check-out manual berhasil!</b>\nResponse: <code>${JSON.stringify(result)}</code>`, { parse_mode: "HTML" });
+        } catch (err) {
+          await bot.sendMessage(chatId, `❌ <b>Check-out manual gagal:</b> ${err.message}`, { parse_mode: "HTML" });
+        }
+      }
+    } catch (err) {
+      log(`Error handling command ${command}: ${err.message}`);
+      await bot.sendMessage(chatId, `Terjadi kesalahan saat memproses perintah: ${err.message}`, { parse_mode: "HTML" });
+    }
+  });
 }
 
 // ============================================================
@@ -231,7 +464,9 @@ async function checkIn(token) {
 async function checkOut(token) {
   const latitude = jitterCoordinate(CONFIG.baseLatitude);
   const longitude = jitterCoordinate(CONFIG.baseLongitude);
-  const note = CONFIG.defaultNote;
+  
+  const settings = loadSettings();
+  const note = settings.customNote || CONFIG.defaultNote;
 
   log(`Check-out dengan koordinat: ${latitude}, ${longitude} | Note: "${note}"`);
 
@@ -295,15 +530,40 @@ async function logout(token) {
  * Execute check-in flow with retry
  */
 async function executeCheckIn() {
+  const todayStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" });
+
+  // 1. Weekend Check
   if (isWeekend()) {
-    log(`Hari ini ${getDayName()}, skip check-in (weekend)`);
+    log(`Hari ini ${getDayName()} (${todayStr}), skip check-in (weekend)`);
     return;
+  }
+
+  // 2. Holiday API Check
+  const holiday = await checkIndonesianHoliday();
+  if (holiday) {
+    log(`Hari ini hari libur nasional (${holiday}), skip check-in`);
+    await sendTelegramNotification(`📢 <b>Check-in Terlewati</b>\nHari ini (${todayStr}) adalah Hari Libur Nasional: <b>${holiday}</b>. Absensi otomatis dilewati.`);
+    return;
+  }
+
+  // 3. Manual Leave/Skip Check
+  const settings = loadSettings();
+  if (settings.skipUntil) {
+    const skipUntilDate = new Date(settings.skipUntil);
+    const todayDate = new Date(todayStr);
+    if (todayDate <= skipUntilDate) {
+      log(`Hari ini (${todayStr}) diset skip/cuti sampai ${settings.skipUntil}, skip check-in`);
+      await sendTelegramNotification(`📢 <b>Check-in Terlewati</b>\nHari ini (${todayStr}) dalam masa cuti/skip manual (sampai ${settings.skipUntil}). Absensi otomatis dilewati.`);
+      return;
+    }
   }
 
   // Random delay: 0-20 menit (dalam ms)
   const delayMinutes = randomInt(0, 20);
   const delayMs = delayMinutes * 60 * 1000 + randomInt(0, 59) * 1000;
-  log(`Check-in dijadwalkan, delay ${delayMinutes} menit ${Math.floor((delayMs % 60000) / 1000)} detik...`);
+  const msg = `🕒 <b>Check-in Terjadwal</b>\nJadwal check-in hari ini dimulai dengan delay ${delayMinutes} menit ${Math.floor((delayMs % 60000) / 1000)} detik...`;
+  log(msg.replace(/<[^>]*>/g, ""));
+  await sendTelegramNotification(msg);
 
   await sleep(delayMs);
 
@@ -321,10 +581,11 @@ async function executeCheckIn() {
         return;
       }
 
-      await checkIn(token);
+      const result = await checkIn(token);
       await logout(token);
 
       log("Check-in flow selesai!\n");
+      await sendTelegramNotification(`✅ <b>Check-in Berhasil!</b>\n• Jam: <code>${getTimestamp()}</code>\n• Koordinat: <code>${result.checkInLat || "-"}, ${result.checkInLng || "-"}</code>`);
       return;
     } catch (err) {
       log(`Check-in attempt ${attempt} gagal: ${err.message}`);
@@ -334,6 +595,7 @@ async function executeCheckIn() {
         await sleep(retryDelay);
       } else {
         log("Semua check-in attempts gagal!\n");
+        await sendTelegramNotification(`❌ <b>Check-in Gagal!</b>\nSemua attempt (${maxRetries}x) gagal.\nError: <code>${err.message}</code>`);
       }
     }
   }
@@ -343,15 +605,40 @@ async function executeCheckIn() {
  * Execute check-out flow with retry
  */
 async function executeCheckOut() {
+  const todayStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" });
+
+  // 1. Weekend Check
   if (isWeekend()) {
-    log(`Hari ini ${getDayName()}, skip check-out (weekend)`);
+    log(`Hari ini ${getDayName()} (${todayStr}), skip check-out (weekend)`);
     return;
+  }
+
+  // 2. Holiday API Check
+  const holiday = await checkIndonesianHoliday();
+  if (holiday) {
+    log(`Hari ini hari libur nasional (${holiday}), skip check-out`);
+    await sendTelegramNotification(`📢 <b>Check-out Terlewati</b>\nHari ini (${todayStr}) adalah Hari Libur Nasional: <b>${holiday}</b>. Absensi otomatis dilewati.`);
+    return;
+  }
+
+  // 3. Manual Leave/Skip Check
+  const settings = loadSettings();
+  if (settings.skipUntil) {
+    const skipUntilDate = new Date(settings.skipUntil);
+    const todayDate = new Date(todayStr);
+    if (todayDate <= skipUntilDate) {
+      log(`Hari ini (${todayStr}) diset skip/cuti sampai ${settings.skipUntil}, skip check-out`);
+      await sendTelegramNotification(`📢 <b>Check-out Terlewati</b>\nHari ini (${todayStr}) dalam masa cuti/skip manual (sampai ${settings.skipUntil}). Absensi otomatis dilewati.`);
+      return;
+    }
   }
 
   // Random delay: 0-30 menit (dalam ms)
   const delayMinutes = randomInt(0, 30);
   const delayMs = delayMinutes * 60 * 1000 + randomInt(0, 59) * 1000;
-  log(`Check-out dijadwalkan, delay ${delayMinutes} menit ${Math.floor((delayMs % 60000) / 1000)} detik...`);
+  const msg = `🕒 <b>Check-out Terjadwal</b>\nJadwal check-out hari ini dimulai dengan delay ${delayMinutes} menit ${Math.floor((delayMs % 60000) / 1000)} detik...`;
+  log(msg.replace(/<[^>]*>/g, ""));
+  await sendTelegramNotification(msg);
 
   await sleep(delayMs);
 
@@ -369,10 +656,11 @@ async function executeCheckOut() {
         return;
       }
 
-      await checkOut(token);
+      const result = await checkOut(token);
       await logout(token);
 
       log("Check-out flow selesai!\n");
+      await sendTelegramNotification(`✅ <b>Check-out Berhasil!</b>\n• Jam: <code>${getTimestamp()}</code>\n• Note: "${result.checkOutNote || "-"}"\n• Koordinat: <code>${result.checkOutLat || "-"}, ${result.checkOutLng || "-"}</code>`);
       return;
     } catch (err) {
       log(`Check-out attempt ${attempt} gagal: ${err.message}`);
@@ -382,6 +670,7 @@ async function executeCheckOut() {
         await sleep(retryDelay);
       } else {
         log("Semua check-out attempts gagal!\n");
+        await sendTelegramNotification(`❌ <b>Check-out Gagal!</b>\nSemua attempt (${maxRetries}x) gagal.\nError: <code>${err.message}</code>`);
       }
     }
   }
@@ -414,6 +703,12 @@ function startScheduler() {
   });
 
   log("Cron jobs registered. Waiting for next trigger...\n");
+
+  sendTelegramNotification(`🚀 <b>PRMS Auto Attendance Teraktifkan!</b>\n` +
+    `• User: <code>${CONFIG.email}</code>\n` +
+    `• Jadwal: Senin-Jumat\n` +
+    `• Check-in: 07:50 WIB (delay 0-20m)\n` +
+    `• Check-out: 17:30 WIB (delay 0-30m)`);
 }
 
 // ============================================================
