@@ -1,7 +1,18 @@
+try {
+  require("dotenv").config();
+} catch (e) {
+  // dotenv not installed/loaded, ignore
+}
+
 const fs = require("fs");
 const path = require("path");
 const cron = require("node-cron");
 const { TelegramBot } = require("node-telegram-bot-api");
+
+// Bypass deprecation warning for deleteWebHook in node-telegram-bot-api's internal polling code
+if (TelegramBot && TelegramBot.prototype) {
+  TelegramBot.prototype.deleteWebHook = TelegramBot.prototype.deleteWebhook;
+}
 
 // ============================================================
 // Configuration & Settings
@@ -17,7 +28,7 @@ const CONFIG = {
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
 };
 
-const SETTINGS_FILE = path.join(__dirname, "settings.json");
+const SETTINGS_FILE = process.env.SETTINGS_PATH || path.join(__dirname, "settings.json");
 
 /**
  * Load settings from file or return default
