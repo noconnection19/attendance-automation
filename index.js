@@ -30,6 +30,15 @@ const CONFIG = {
 
 const SETTINGS_FILE = process.env.SETTINGS_PATH || path.join(__dirname, "settings.json");
 
+// Token expiry: 23 jam (safety margin dari 24 jam PRMS)
+const TOKEN_TTL_MS = 23 * 60 * 60 * 1000;
+
+// In-memory token cache
+let tokenCache = {
+  token: null,
+  expiresAt: null, // timestamp ms
+};
+
 /**
  * Load settings from file or return default
  */
@@ -37,7 +46,19 @@ function loadSettings() {
   try {
     if (fs.existsSync(SETTINGS_FILE)) {
       const data = fs.readFileSync(SETTINGS_FILE, "utf8");
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      // Restore token cache dari file jika ada dan belum expired
+      if (parsed._token && parsed._tokenExpiresAt) {
+        const expiresAt = new Date(parsed._tokenExpiresAt).getTime();
+        if (Date.now() < expiresAt) {
+          tokenCache.token = parsed._token;
+          tokenCache.expiresAt = expiresAt;
+          log(`[Token] Token tersimpan di-load dari file, valid hingga: ${new Date(expiresAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })}`);
+        } else {
+          log(`[Token] Token tersimpan di file sudah expired, akan login ulang saat dibutuhkan.`);
+        }
+      }
+      return parsed;
     }
   } catch (err) {
     console.error(`[Settings] Gagal memuat file pengaturan: ${err.message}`);
@@ -53,6 +74,87 @@ function saveSettings(settings) {
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf8");
   } catch (err) {
     console.error(`[Settings] Gagal menyimpan file pengaturan: ${err.message}`);
+  }
+}
+
+/**
+ * Simpan token ke settings.json agar persist jika restart
+ */
+function saveTokenToFile(token, expiresAt) {
+  try {
+    const settings = loadSettingsRaw();
+    settings._token = token;
+    settings._tokenExpiresAt = new Date(expiresAt).toISOString();
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf8");
+  } catch (err) {
+    console.error(`[Token] Gagal menyimpan token ke file: ${err.message}`);
+  }
+}
+
+/**
+ * Load raw settings tanpa side-effect token cache restore
+ */
+function loadSettingsRaw() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const data = fs.readFileSync(SETTINGS_FILE, "utf8");
+      return JSON.parse(data);
+    }
+  } catch (err) {
+    // ignore
+  }
+  return { customNote: null, skipUntil: null };
+}
+
+/**
+ * Dapatkan token yang valid: gunakan cache jika masih valid, login jika tidak.
+ * Jika login gagal (misal 502) tapi masih ada cache, pakai cache sebagai fallback.
+ */
+async function getValidToken() {
+  const now = Date.now();
+
+  // Cek cache in-memory
+  if (tokenCache.token && tokenCache.expiresAt && now < tokenCache.expiresAt) {
+    const sisaJam = ((tokenCache.expiresAt - now) / 3600000).toFixed(1);
+    log(`[Token] Menggunakan token cache (sisa ${sisaJam} jam)`);
+    return tokenCache.token;
+  }
+
+  // Cache kosong / expired — coba login
+  log(`[Token] Cache kosong atau expired, melakukan login baru...`);
+  try {
+    const token = await login();
+    const expiresAt = now + TOKEN_TTL_MS;
+    tokenCache.token = token;
+    tokenCache.expiresAt = expiresAt;
+    saveTokenToFile(token, expiresAt);
+    log(`[Token] Token baru disimpan, berlaku hingga: ${new Date(expiresAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })}`);
+    return token;
+  } catch (err) {
+    log(`[Token] Login gagal: ${err.message}`);
+    // Fallback: jika masih ada token lama (meski expired), coba pakai
+    if (tokenCache.token) {
+      log(`[Token] ⚠️ Fallback ke token lama yang sudah expired karena login gagal (API tidak stabil).`);
+      return tokenCache.token;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Invalidasi token cache (misal saat dapat 401/403 dari API)
+ */
+function invalidateTokenCache() {
+  log(`[Token] Cache token di-invalidasi.`);
+  tokenCache.token = null;
+  tokenCache.expiresAt = null;
+  try {
+    const settings = loadSettingsRaw();
+    delete settings._token;
+    delete settings._tokenExpiresAt;
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf8");
+  } catch (err) {
+    // ignore
   }
 }
 
@@ -249,12 +351,23 @@ if (bot) {
         }
         
         const noteUsed = settings.customNote || CONFIG.defaultNote;
+
+        // Info token cache
+        let tokenStatus;
+        if (tokenCache.token && tokenCache.expiresAt && Date.now() < tokenCache.expiresAt) {
+          const sisaJam = ((tokenCache.expiresAt - Date.now()) / 3600000).toFixed(1);
+          const expStr = new Date(tokenCache.expiresAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" });
+          tokenStatus = `✅ Valid (sisa ~${sisaJam} jam, exp: ${expStr})`;
+        } else {
+          tokenStatus = `❌ Tidak ada / Expired (akan login saat dibutuhkan)`;
+        }
         
         const statusMessage = `<b>📊 Status PRMS Auto Attendance</b>\n\n` +
           `• <b>User:</b> <code>${CONFIG.email}</code>\n` +
           `• <b>Lokasi:</b> <code>${CONFIG.baseLatitude}, ${CONFIG.baseLongitude}</code>\n` +
           `• <b>Note Checkout:</b> "${noteUsed}" ${settings.customNote ? "(Custom)" : "(Default)"}\n` +
           `• <b>Status Jadwal:</b> ${statusCuti}\n` +
+          `• <b>Token Cache:</b> ${tokenStatus}\n` +
           `• <b>Hari Ini (${getDayName()}, ${todayStr}):</b>\n` +
           `  - Weekend: ${isWeekend() ? "Ya 🛑" : "Tidak ✅"}\n` +
           `  - Hari Libur: ${holidayDesc ? `Ya (${holidayDesc}) 🛑` : "Tidak ✅"}`;
@@ -314,15 +427,13 @@ if (bot) {
       else if (command === "/checkin_now") {
         await bot.sendMessage(chatId, "Menginisiasi check-in manual instan sekarang...", { parse_mode: "HTML" });
         try {
-          const token = await login();
+          const token = await getValidToken();
           const status = await getAttendanceStatus(token);
           if (status.checkedIn) {
             await bot.sendMessage(chatId, "Sudah check-in hari ini, aksi dibatalkan.", { parse_mode: "HTML" });
-            await logout(token);
             return;
           }
           const result = await checkIn(token);
-          await logout(token);
           await bot.sendMessage(chatId, `✅ <b>Check-in manual berhasil!</b>\nResponse: <code>${JSON.stringify(result)}</code>`, { parse_mode: "HTML" });
         } catch (err) {
           await bot.sendMessage(chatId, `❌ <b>Check-in manual gagal:</b> ${err.message}`, { parse_mode: "HTML" });
@@ -331,15 +442,13 @@ if (bot) {
       else if (command === "/checkout_now") {
         await bot.sendMessage(chatId, "Menginisiasi check-out manual instan sekarang...", { parse_mode: "HTML" });
         try {
-          const token = await login();
+          const token = await getValidToken();
           const status = await getAttendanceStatus(token);
           if (status.checkedOut) {
             await bot.sendMessage(chatId, "Sudah check-out hari ini, aksi dibatalkan.", { parse_mode: "HTML" });
-            await logout(token);
             return;
           }
           const result = await checkOut(token);
-          await logout(token);
           await bot.sendMessage(chatId, `✅ <b>Check-out manual berhasil!</b>\nResponse: <code>${JSON.stringify(result)}</code>`, { parse_mode: "HTML" });
         } catch (err) {
           await bot.sendMessage(chatId, `❌ <b>Check-out manual gagal:</b> ${err.message}`, { parse_mode: "HTML" });
@@ -594,38 +703,66 @@ async function executeCheckIn() {
 
   await sleep(delayMs);
 
-  const maxRetries = 3;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      log(`Check-in attempt ${attempt}/${maxRetries} - ${getDayName()}, ${getTimestamp()}`);
+  // Deadline: 09:00 WIB — di atas itu tidak masuk akal checkin lagi
+  const deadlineHour = 9;
+  const now = new Date();
+  const deadline = new Date(now.toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" }));
+  deadline.setUTCHours(deadlineHour - 7); // convert WIB to UTC (WIB = UTC+7)
+  const RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 menit
+  const WARN_EVERY = 3; // kirim notif Telegram setiap N kali gagal berurutan
 
-      const token = await login();
+  let attempt = 0;
+  let lastError = null;
+
+  while (Date.now() < deadline.getTime()) {
+    attempt++;
+    const sisaMs = deadline.getTime() - Date.now();
+    const sisaMenit = Math.floor(sisaMs / 60000);
+    try {
+      log(`Check-in attempt #${attempt} - ${getDayName()}, ${getTimestamp()} (deadline dalam ${sisaMenit} menit)`);
+
+      const token = await getValidToken();
       const status = await getAttendanceStatus(token);
 
       if (status.checkedIn) {
         log("Sudah check-in hari ini, skip check-in flow.");
-        await logout(token);
         return;
       }
 
       const result = await checkIn(token);
-      await logout(token);
 
       log("Check-in flow selesai!\n");
-      await sendTelegramNotification(`✅ <b>Check-in Berhasil!</b>\n• Jam: <code>${getTimestamp()}</code>\n• Koordinat: <code>${result.checkInLat || "-"}, ${result.checkInLng || "-"}</code>`);
+      await sendTelegramNotification(`✅ <b>Check-in Berhasil!</b>\n• Jam: <code>${getTimestamp()}</code>${attempt > 1 ? `\n• Berhasil setelah ${attempt} percobaan` : ""}\n• Koordinat: <code>${result.checkInLat || "-"}, ${result.checkInLng || "-"}</code>`);
       return;
     } catch (err) {
-      log(`Check-in attempt ${attempt} gagal: ${err.message}`);
-      if (attempt < maxRetries) {
-        const retryDelay = randomInt(30, 120) * 1000;
-        log(`Retry dalam ${Math.floor(retryDelay / 1000)} detik...`);
-        await sleep(retryDelay);
-      } else {
-        log("Semua check-in attempts gagal!\n");
-        await sendTelegramNotification(`❌ <b>Check-in Gagal!</b>\nSemua attempt (${maxRetries}x) gagal.\nError: <code>${err.message}</code>`);
+      lastError = err;
+      log(`Check-in attempt #${attempt} gagal: ${err.message}`);
+
+      // Jika 401/403 (bukan masalah API tidak stabil), invalidasi cache dan STOP retry
+      if (err.message.includes("401") || err.message.includes("403") || err.message.includes("Unauthorized")) {
+        invalidateTokenCache();
+        log("Check-in dihentikan karena error autentikasi (401/403).");
+        await sendTelegramNotification(`❌ <b>Check-in Gagal — Error Autentikasi</b>\nError 401/403 diterima, retry dihentikan.\nError: <code>${err.message}</code>`);
+        return;
+      }
+
+      // Kirim notif peringatan setiap WARN_EVERY kali gagal (tidak spam setiap attempt)
+      if (attempt % WARN_EVERY === 0) {
+        await sendTelegramNotification(`⚠️ <b>Check-in Belum Berhasil</b>\nSudah ${attempt}x percobaan, API masih tidak stabil.\nAkan terus retry hingga 09:00 WIB (sisa ~${sisaMenit} menit).\nError terakhir: <code>${err.message}</code>`);
+      }
+
+      // Tunggu sebelum retry berikutnya (jika masih ada waktu)
+      const nextRetryMs = Math.min(RETRY_INTERVAL_MS, deadline.getTime() - Date.now());
+      if (nextRetryMs > 5000) {
+        log(`Retry dalam ${Math.floor(nextRetryMs / 1000)} detik...`);
+        await sleep(nextRetryMs);
       }
     }
   }
+
+  // Keluar dari loop karena deadline tercapai
+  log("Check-in gagal sampai deadline 09:00 WIB.\n");
+  await sendTelegramNotification(`❌ <b>Check-in Gagal!</b>\nSudah ${attempt}x percobaan hingga deadline 09:00 WIB, semua gagal.\nError terakhir: <code>${lastError?.message || "unknown"}</code>\nGunakan /checkin_now jika ingin coba manual.`);
 }
 
 /**
@@ -669,43 +806,99 @@ async function executeCheckOut() {
 
   await sleep(delayMs);
 
-  const maxRetries = 3;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      log(`Check-out attempt ${attempt}/${maxRetries} - ${getDayName()}, ${getTimestamp()}`);
+  // Deadline: 19:00 WIB — di atas itu tidak wajar checkout
+  const deadlineHour = 19;
+  const now = new Date();
+  const deadline = new Date(now.toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" }));
+  deadline.setUTCHours(deadlineHour - 7); // convert WIB to UTC (WIB = UTC+7)
+  const RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 menit
+  const WARN_EVERY = 3; // kirim notif Telegram setiap N kali gagal berurutan
 
-      const token = await login();
+  let attempt = 0;
+  let lastError = null;
+
+  while (Date.now() < deadline.getTime()) {
+    attempt++;
+    const sisaMs = deadline.getTime() - Date.now();
+    const sisaMenit = Math.floor(sisaMs / 60000);
+    try {
+      log(`Check-out attempt #${attempt} - ${getDayName()}, ${getTimestamp()} (deadline dalam ${sisaMenit} menit)`);
+
+      const token = await getValidToken();
       const status = await getAttendanceStatus(token);
 
       if (status.checkedOut) {
         log("Sudah check-out hari ini, skip check-out flow.");
-        await logout(token);
         return;
       }
 
       const result = await checkOut(token);
-      await logout(token);
 
       log("Check-out flow selesai!\n");
-      await sendTelegramNotification(`✅ <b>Check-out Berhasil!</b>\n• Jam: <code>${getTimestamp()}</code>\n• Note: "${result.checkOutNote || "-"}"\n• Koordinat: <code>${result.checkOutLat || "-"}, ${result.checkOutLng || "-"}</code>`);
+      await sendTelegramNotification(`✅ <b>Check-out Berhasil!</b>\n• Jam: <code>${getTimestamp()}</code>${attempt > 1 ? `\n• Berhasil setelah ${attempt} percobaan` : ""}\n• Note: "${result.checkOutNote || "-"}"\n• Koordinat: <code>${result.checkOutLat || "-"}, ${result.checkOutLng || "-"}</code>`);
       return;
     } catch (err) {
-      log(`Check-out attempt ${attempt} gagal: ${err.message}`);
-      if (attempt < maxRetries) {
-        const retryDelay = randomInt(30, 120) * 1000;
-        log(`Retry dalam ${Math.floor(retryDelay / 1000)} detik...`);
-        await sleep(retryDelay);
-      } else {
-        log("Semua check-out attempts gagal!\n");
-        await sendTelegramNotification(`❌ <b>Check-out Gagal!</b>\nSemua attempt (${maxRetries}x) gagal.\nError: <code>${err.message}</code>`);
+      lastError = err;
+      log(`Check-out attempt #${attempt} gagal: ${err.message}`);
+
+      // Jika 401/403 (bukan masalah API tidak stabil), invalidasi cache dan STOP retry
+      if (err.message.includes("401") || err.message.includes("403") || err.message.includes("Unauthorized")) {
+        invalidateTokenCache();
+        log("Check-out dihentikan karena error autentikasi (401/403).");
+        await sendTelegramNotification(`❌ <b>Check-out Gagal — Error Autentikasi</b>\nError 401/403 diterima, retry dihentikan.\nError: <code>${err.message}</code>`);
+        return;
+      }
+
+      // Kirim notif peringatan setiap WARN_EVERY kali gagal (tidak spam setiap attempt)
+      if (attempt % WARN_EVERY === 0) {
+        await sendTelegramNotification(`⚠️ <b>Check-out Belum Berhasil</b>\nSudah ${attempt}x percobaan, API masih tidak stabil.\nAkan terus retry hingga 19:00 WIB (sisa ~${sisaMenit} menit).\nError terakhir: <code>${err.message}</code>`);
+      }
+
+      // Tunggu sebelum retry berikutnya (jika masih ada waktu)
+      const nextRetryMs = Math.min(RETRY_INTERVAL_MS, deadline.getTime() - Date.now());
+      if (nextRetryMs > 5000) {
+        log(`Retry dalam ${Math.floor(nextRetryMs / 1000)} detik...`);
+        await sleep(nextRetryMs);
       }
     }
   }
+
+  // Keluar dari loop karena deadline tercapai
+  log("Check-out gagal sampai deadline 19:00 WIB.\n");
+  await sendTelegramNotification(`❌ <b>Check-out Gagal!</b>\nSudah ${attempt}x percobaan hingga deadline 19:00 WIB, semua gagal.\nError terakhir: <code>${lastError?.message || "unknown"}</code>\nGunakan /checkout_now jika ingin coba manual.`);
 }
 
 // ============================================================
 // Scheduler Setup
 // ============================================================
+
+/**
+ * Pre-login pagi: simpan token sebelum jadwal check-in
+ * Dijalankan jam 07:00 WIB agar token sudah siap saat check-in jam 07:50+
+ */
+async function executePreLogin() {
+  if (isWeekend()) return;
+
+  log("[Pre-Login] Melakukan pre-login pagi hari untuk menyimpan token...");
+  try {
+    // Invalidasi cache dulu agar dapat token segar
+    tokenCache.token = null;
+    tokenCache.expiresAt = null;
+
+    const token = await login();
+    const expiresAt = Date.now() + TOKEN_TTL_MS;
+    tokenCache.token = token;
+    tokenCache.expiresAt = expiresAt;
+    saveTokenToFile(token, expiresAt);
+
+    const expStr = new Date(expiresAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" });
+    log(`[Pre-Login] ✅ Token pagi berhasil disimpan, berlaku hingga: ${expStr}`);
+    await sendTelegramNotification(`🔑 <b>Pre-Login Berhasil</b>\nToken tersimpan dan siap digunakan untuk check-in & check-out hari ini.\n• Berlaku hingga: <code>${expStr}</code>`);
+  } catch (err) {
+    log(`[Pre-Login] ❌ Gagal: ${err.message}`);
+    await sendTelegramNotification(`⚠️ <b>Pre-Login Gagal</b>\nGagal menyimpan token pagi ini: <code>${err.message}</code>\nBot akan mencoba login ulang saat check-in/checkout.`);
+  }
+}
 
 function startScheduler() {
   log("PRMS Auto Attendance started!");
@@ -714,10 +907,16 @@ function startScheduler() {
   log(`Default Note: ${CONFIG.defaultNote}`);
   log("---");
   log("Schedule:");
+  log("   Pre-Login: 07:00 WIB (simpan token untuk hari ini)");
   log("   Check-in:  07:50 WIB + random 0-20 min (jadi 07:50-08:10)");
   log("   Check-out: 17:30 WIB + random 0-30 min (jadi 17:30-18:00)");
   log("   Weekend:   SKIP");
   log("---\n");
+
+  // Pre-login: jam 07:00 WIB, Senin-Jumat
+  cron.schedule("0 7 * * 1-5", executePreLogin, {
+    timezone: "Asia/Jakarta",
+  });
 
   // Check-in: jam 07:50 WIB, Senin-Jumat
   cron.schedule("50 7 * * 1-5", executeCheckIn, {
@@ -734,6 +933,7 @@ function startScheduler() {
   sendTelegramNotification(`🚀 <b>PRMS Auto Attendance Teraktifkan!</b>\n` +
     `• User: <code>${CONFIG.email}</code>\n` +
     `• Jadwal: Senin-Jumat\n` +
+    `• Pre-Login: 07:00 WIB (token disimpan)\n` +
     `• Check-in: 07:50 WIB (delay 0-20m)\n` +
     `• Check-out: 17:30 WIB (delay 0-30m)`);
 }
