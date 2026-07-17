@@ -18,7 +18,7 @@ if (TelegramBot && TelegramBot.prototype) {
 // Configuration & Settings
 // ============================================================
 const CONFIG = {
-  apiBase: "https://prms-api.fid-app.my.id/api",
+  apiBase: process.env.API_BASE || "https://prms.codepilot.my.id/api",
   email: process.env.EMAIL,
   password: process.env.PASSWORD,
   baseLatitude: parseFloat(process.env.BASE_LATITUDE || "-6.159868350846804"),
@@ -250,7 +250,7 @@ async function checkIndonesianHoliday() {
     const todayStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" }); // "YYYY-MM-DD"
     const year = todayStr.split("-")[0];
     const url = `https://api-hari-libur.vercel.app/api?year=${year}`;
-    
+
     log(`Checking holiday status from API for today (${todayStr})...`);
     const response = await fetch(url);
     if (!response.ok) {
@@ -310,18 +310,18 @@ if (bot) {
   bot.on("message", async (msg) => {
     const chatId = msg.chat.id.toString();
     const authorizedChatId = CONFIG.telegramChatId.toString();
-    
+
     if (chatId !== authorizedChatId) {
       log(`Unauthorized message received from chat ID: ${chatId}`);
       return;
     }
-    
+
     const text = msg.text ? msg.text.trim() : "";
     if (!text.startsWith("/")) return;
-    
+
     const args = text.split(" ");
     const command = args[0].toLowerCase();
-    
+
     try {
       if (command === "/start" || command === "/help") {
         const helpMessage = `<b>🤖 PRMS Auto Attendance Bot</b>\n\n` +
@@ -340,7 +340,7 @@ if (bot) {
         const settings = loadSettings();
         const todayStr = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" });
         const holidayDesc = await checkIndonesianHoliday();
-        
+
         let statusCuti = "Aktif (Mengecek Jadwal)";
         if (settings.skipUntil) {
           const skipUntilDate = new Date(settings.skipUntil);
@@ -349,7 +349,7 @@ if (bot) {
             statusCuti = `Cuti (Skip Absen hingga ${settings.skipUntil})`;
           }
         }
-        
+
         const noteUsed = settings.customNote || CONFIG.defaultNote;
 
         // Info token cache
@@ -361,7 +361,7 @@ if (bot) {
         } else {
           tokenStatus = `❌ Tidak ada / Expired (akan login saat dibutuhkan)`;
         }
-        
+
         const statusMessage = `<b>📊 Status PRMS Auto Attendance</b>\n\n` +
           `• <b>User:</b> <code>${CONFIG.email}</code>\n` +
           `• <b>Lokasi:</b> <code>${CONFIG.baseLatitude}, ${CONFIG.baseLongitude}</code>\n` +
@@ -371,7 +371,7 @@ if (bot) {
           `• <b>Hari Ini (${getDayName()}, ${todayStr}):</b>\n` +
           `  - Weekend: ${isWeekend() ? "Ya 🛑" : "Tidak ✅"}\n` +
           `  - Hari Libur: ${holidayDesc ? `Ya (${holidayDesc}) 🛑` : "Tidak ✅"}`;
-        
+
         await bot.sendMessage(chatId, statusMessage, { parse_mode: "HTML" });
       }
       else if (command === "/note") {
@@ -381,10 +381,10 @@ if (bot) {
           await bot.sendMessage(chatId, `Catatan checkout saat ini:\n"${currentNote}" ${settings.customNote ? "(Custom)" : "(Default)"}`, { parse_mode: "HTML" });
           return;
         }
-        
+
         const action = args.slice(1).join(" ");
         const settings = loadSettings();
-        
+
         if (action.toLowerCase() === "reset") {
           settings.customNote = null;
           saveSettings(settings);
@@ -412,7 +412,7 @@ if (bot) {
           await bot.sendMessage(chatId, "Format tanggal salah. Gunakan format YYYY-MM-DD (contoh: 2026-07-15)", { parse_mode: "HTML" });
           return;
         }
-        
+
         const settings = loadSettings();
         settings.skipUntil = targetDate;
         saveSettings(settings);
@@ -515,11 +515,11 @@ async function login() {
  */
 async function getAttendanceStatus(token) {
   const now = new Date();
-  
+
   // Format month and year based on Jakarta timezone
   const month = now.toLocaleDateString("en-US", { timeZone: "Asia/Jakarta", month: "numeric" });
   const year = now.toLocaleDateString("en-US", { timeZone: "Asia/Jakarta", year: "numeric" });
-  
+
   const url = `${CONFIG.apiBase}/attendance/me?month=${month}&year=${year}&_t=${Date.now()}`;
   log(`Checking attendance status from API...`);
 
@@ -541,9 +541,9 @@ async function getAttendanceStatus(token) {
 
   const data = await response.json();
   const todayStr = now.toLocaleDateString("sv-SE", { timeZone: "Asia/Jakarta" }); // Returns "YYYY-MM-DD"
-  
-  const todayRecord = Array.isArray(data) 
-    ? data.find(r => r.date && r.date.startsWith(todayStr)) 
+
+  const todayRecord = Array.isArray(data)
+    ? data.find(r => r.date && r.date.startsWith(todayStr))
     : null;
 
   const status = {
@@ -600,7 +600,7 @@ async function checkIn(token) {
 async function checkOut(token) {
   const latitude = jitterCoordinate(CONFIG.baseLatitude);
   const longitude = jitterCoordinate(CONFIG.baseLongitude);
-  
+
   const settings = loadSettings();
   const note = settings.customNote || CONFIG.defaultNote;
 
